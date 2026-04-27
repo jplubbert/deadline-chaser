@@ -15,7 +15,7 @@ personas, trabajos pendientes y cálculo de holgura en horas hábiles.
 Cinco tablas en el schema `public`:
 
 - `roles`, `areas` — catálogos
-- `personas` — con `nivel_roce` (`bajo` | `medio` | `alto`, tipo `nivel_ctm_enum`) y
+- `personas` — con `nivel_roce` (`bajo` | `medio` | `alto`, tipo `nivel_roce_enum`) y
   `lead_time_promedio_horas`
 - `trabajos` — `descripcion`, `deadline`, `estado`, `holgura_horas`,
   `persona_asignada_id`
