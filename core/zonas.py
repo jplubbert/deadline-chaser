@@ -1,3 +1,17 @@
+"""Capa estadística base: clasifica trabajos por holgura vs lead_time + σ.
+
+Todo en horas hábiles. El nivel_roce NO afecta esta clasificación; queda
+disponible en el dict de salida para que la capa de redacción ajuste tono.
+
+Los umbrales corresponden a percentiles de la distribución normal del
+lead_time esperado por persona (μ = lead_time_promedio_horas, σ):
+    p97 = μ + 2σ  (≈ percentil 97.5)
+    p84 = μ +  σ  (≈ percentil 84.1)
+    p50 = μ        (≈ percentil 50)
+La zona "critico" se gatilla cuando la holgura cae bajo p50: ya no es
+estadísticamente probable que la persona alcance a entregar.
+"""
+
 from decimal import Decimal
 from typing import Literal
 
@@ -7,40 +21,39 @@ from core.db import get_connection
 from core.queries import calcular_holgura_horas_habiles
 
 NivelRoce = Literal["bajo", "medio", "alto"]
-Zona = Literal["verde", "amarilla", "roja"]
+Zona = Literal["p97", "p84", "p50", "critico"]
 
-BUFFERS_POR_ROCE: dict[NivelRoce, Decimal] = {
-    "bajo": Decimal("0.30"),
-    "medio": Decimal("0.50"),
-    "alto": Decimal("0.80"),
-}
-
-Z_95 = Decimal("1.645")
-SIGMA_DEFAULT_FRACCION = Decimal("0.30")
+SIGMA_DEFAULT_FRACCION = Decimal("1.00")
 _Q = Decimal("0.01")
 
 
-def calcular_umbral_zona_verde(
-    lead_time_promedio: Decimal,
-    sigma: Decimal,
-    nivel_roce: NivelRoce,
-) -> Decimal:
-    lead = Decimal(lead_time_promedio)
-    sig = Decimal(sigma)
-    umbral_95 = lead + Z_95 * sig
-    factor = Decimal(1) + BUFFERS_POR_ROCE[nivel_roce]
-    return (umbral_95 * factor).quantize(_Q)
+def calcular_umbrales(
+    lead_time_horas: Decimal,
+    sigma_horas: Decimal,
+) -> dict[str, Decimal]:
+    """Devuelve los 3 umbrales (p97, p84, p50) en horas hábiles."""
+    lead = Decimal(lead_time_horas)
+    sig = Decimal(sigma_horas)
+    return {
+        "p97": (lead + Decimal(2) * sig).quantize(_Q),
+        "p84": (lead + sig).quantize(_Q),
+        "p50": lead.quantize(_Q),
+    }
 
 
 def clasificar_zona(
-    holgura_horas_habiles: Decimal,
-    umbral_verde: Decimal,
+    horas_deadline: Decimal,
+    p97: Decimal,
+    p84: Decimal,
+    p50: Decimal,
 ) -> Zona:
-    if holgura_horas_habiles >= umbral_verde:
-        return "verde"
-    if holgura_horas_habiles >= umbral_verde / Decimal(2):
-        return "amarilla"
-    return "roja"
+    if horas_deadline >= p97:
+        return "p97"
+    if horas_deadline >= p84:
+        return "p84"
+    if horas_deadline >= p50:
+        return "p50"
+    return "critico"
 
 
 def evaluar_trabajo(trabajo_id: int) -> dict | None:
@@ -50,10 +63,15 @@ def evaluar_trabajo(trabajo_id: int) -> dict | None:
                 t.deadline,
                 p.persona_id,
                 p.nombre        AS persona_nombre,
+                p.correo        AS persona_correo,
                 p.nivel_roce,
-                p.lead_time_promedio_horas
+                p.lead_time_promedio_horas,
+                r.nombre        AS rol,
+                a.nombre        AS area
         FROM    trabajos t
         LEFT JOIN personas p ON p.persona_id = t.persona_asignada_id
+        LEFT JOIN roles    r ON r.rol_id     = p.rol_id
+        LEFT JOIN areas    a ON a.area_id    = p.area_id
         WHERE   t.trabajo_id = %s
     """
     with get_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -63,19 +81,36 @@ def evaluar_trabajo(trabajo_id: int) -> dict | None:
     if row is None or row["persona_id"] is None:
         return None
     lead = row["lead_time_promedio_horas"]
-    if lead is None or row["nivel_roce"] is None:
+    if lead is None:
         return None
 
-    sigma = (Decimal(lead) * SIGMA_DEFAULT_FRACCION).quantize(_Q)
-    umbral = calcular_umbral_zona_verde(lead, sigma, row["nivel_roce"])
-    holgura = calcular_holgura_horas_habiles(trabajo_id)
+    lead_h = Decimal(lead).quantize(_Q)
+    # σ no existe como columna todavía; default = lead * 0.3.
+    # Cuando se persista σ por persona, leerla acá y caer al default solo si es None.
+    sigma_h = (lead_h * SIGMA_DEFAULT_FRACCION).quantize(_Q)
+
+    umbrales = calcular_umbrales(lead_h, sigma_h)
+    horas_deadline = calcular_holgura_horas_habiles(trabajo_id)
+    zona = clasificar_zona(
+        horas_deadline,
+        umbrales["p97"],
+        umbrales["p84"],
+        umbrales["p50"],
+    )
 
     return {
         "trabajo_id": row["trabajo_id"],
         "descripcion": row["descripcion"],
+        "deadline": row["deadline"],
+        "persona_id": row["persona_id"],
         "persona": row["persona_nombre"],
+        "rol": row["rol"],
+        "area": row["area"],
         "nivel_roce": row["nivel_roce"],
-        "holgura": holgura,
-        "umbral_verde": umbral,
-        "zona": clasificar_zona(holgura, umbral),
+        "correo": row["persona_correo"],
+        "horas_deadline": horas_deadline,
+        "lead_time_horas": lead_h,
+        "sigma_horas": sigma_h,
+        **umbrales,
+        "zona": zona,
     }

@@ -7,6 +7,9 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "python-dotenv>=1.0",
     "pytest>=8.0",
+    "langchain-openai>=1.0",
+    "langchain-core>=1.0",
+    "langgraph>=1.0",
 ]
 
 [tool.pytest.ini_options]
