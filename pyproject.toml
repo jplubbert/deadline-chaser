@@ -1,0 +1,13 @@
+[project]
+name = "deadline-chaser"
+version = "0.1.0"
+description = "Agente de seguimiento de deadlines sobre PostgreSQL"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "python-dotenv>=1.0",
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
