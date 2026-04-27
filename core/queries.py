@@ -80,6 +80,27 @@ def _business_seconds_between(start: datetime, end: datetime) -> int:
     return sign * total
 
 
+def ultimo_mensaje_enviado_de_trabajo(trabajo_id: int) -> dict | None:
+    """Devuelve el mensaje más reciente con `enviado_at NOT NULL` para el trabajo.
+
+    Devuelve `None` si no hay ningún mensaje enviado para ese trabajo.
+    """
+    sql = """
+        SELECT  mensaje_id, trabajo_id, remitente_id,
+                destinatarios_to, destinatarios_cc,
+                asunto, contenido,
+                gmail_message_id, timestamp, enviado_at,
+                zona_al_enviar
+        FROM    mensajes
+        WHERE   trabajo_id = %s AND enviado_at IS NOT NULL
+        ORDER BY enviado_at DESC
+        LIMIT   1
+    """
+    with get_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (trabajo_id,))
+        return cur.fetchone()
+
+
 def calcular_holgura_horas_habiles(
     trabajo_id: int,
     *,
