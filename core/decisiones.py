@@ -30,12 +30,48 @@ def decidir_accion(
     trabajo_evaluado: dict[str, Any],
     ultimo_mensaje_enviado: dict[str, Any] | None,
     ahora: datetime,
-) -> dict[str, str]:
-    zona_actual = trabajo_evaluado["zona"]
+) -> dict[str, Any]:
+    """Devuelve {accion, tipo_correo, razon}.
 
+    El estado del trabajo (resultado de procesar respuestas previas) tiene
+    prioridad sobre el throttle por zona.
+    """
+    zona_actual = trabajo_evaluado["zona"]
+    estado = trabajo_evaluado.get("estado", "pendiente")
+
+    if estado == "respondido_ok":
+        return {
+            "accion": "esperar",
+            "tipo_correo": None,
+            "razon": "Trabajo cerrado: respuesta válida recibida.",
+        }
+
+    if estado == "respuesta_con_errores":
+        return {
+            "accion": "enviar",
+            "tipo_correo": "aclaracion_errores",
+            "razon": "Respuesta recibida con errores; pedir corrección.",
+        }
+
+    if estado == "derivado":
+        return {
+            "accion": "enviar",
+            "tipo_correo": "derivado_volver_a_la_misma",
+            "razon": "Respuesta derivó a otra persona; volver al responsable formal.",
+        }
+
+    if estado == "respuesta_ambigua":
+        return {
+            "accion": "enviar",
+            "tipo_correo": "aclaracion_errores",
+            "razon": "Respuesta ambigua; pedir clarificación.",
+        }
+
+    # estado == "pendiente": throttle normal por zona.
     if ultimo_mensaje_enviado is None:
         return {
             "accion": "enviar",
+            "tipo_correo": "primer_envio",
             "razon": f"Primer contacto (zona {zona_actual}).",
         }
 
@@ -43,6 +79,7 @@ def decidir_accion(
     if zona_anterior in ORDEN_ZONA and ORDEN_ZONA[zona_actual] > ORDEN_ZONA[zona_anterior]:
         return {
             "accion": "enviar",
+            "tipo_correo": "recordatorio",
             "razon": f"Zona empeoró: {zona_anterior} → {zona_actual}.",
         }
 
@@ -54,6 +91,7 @@ def decidir_accion(
     if horas_pasadas >= freq_min:
         return {
             "accion": "enviar",
+            "tipo_correo": "recordatorio",
             "razon": (
                 f"Zona {zona_actual}: pasaron {horas_pasadas}h hábiles desde el "
                 f"último envío (mín. {freq_min}h)."
@@ -62,6 +100,7 @@ def decidir_accion(
 
     return {
         "accion": "esperar",
+        "tipo_correo": None,
         "razon": (
             f"Zona {zona_actual}: solo {horas_pasadas}h hábiles desde el último "
             f"envío (mín. {freq_min}h)."

@@ -1,13 +1,16 @@
 """Agente que redacta correos de seguimiento usando GPT-4o-mini.
 
-`generar_correo(trabajo)` recibe el dict de `evaluar_trabajo` y devuelve
-un dict listo para persistir en la tabla `mensajes`:
-    {trabajo_id, remitente_id, destinatarios_to, destinatarios_cc,
-     asunto, contenido}
+Arquitectura:
+- ROUTING (TO/CC), asunto, tono, intención: lógica determinística en Python.
+  El LLM nunca decide a quién mandar el correo ni reglas de escalamiento.
+- REDACCIÓN del cuerpo: el LLM. Recibe destinatario ya resuelto + intención
+  + tratamiento + tono. No ve "zona" ni "tipo_correo" en sus etiquetas
+  internas; solo descripciones en lenguaje natural.
 
-Las direcciones se manejan como `persona_id` (no como email): se asume
-que toda persona-destinataria existe en la tabla `personas`. Los jefes
-de área son personas con rol_id correspondiente al rol "jefe_area".
+`generar_correo(trabajo, tipo_correo, contexto_extra)` devuelve un dict
+listo para persistir en la tabla `mensajes`:
+    {trabajo_id, remitente_id, destinatarios_to, destinatarios_cc,
+     asunto, contenido, zona, tipo_correo}
 """
 
 from pathlib import Path
@@ -18,6 +21,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from core.db import get_connection
+from core.excel_generator import generar_excel_adjunto
 
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_ENV_PATH)
@@ -26,112 +30,56 @@ MODEL = "gpt-4o-mini"
 TEMPERATURA = 0.4
 AGENTE_PERSONA_ID = 0
 
-SUBJECT_POR_ZONA: dict[str, str] = {
-    "p97": "Recordatorio: {descripcion}",
-    "p84": "Recordatorio - Deadline próximo: {descripcion}",
-    "p50": "URGENTE - Deadline en riesgo: {descripcion}",
-    "critico": "Solicito apoyo - Riesgo de incumplimiento: {descripcion}",
-}
 
-_DIAS_ES = [
-    "lunes", "martes", "miércoles", "jueves",
-    "viernes", "sábado", "domingo",
+# --------------------------------------------------------------------------
+# ROUTING DETERMINÍSTICO
+# --------------------------------------------------------------------------
+
+# Matriz de routing. Lista ordenada de (predicado, resultado).
+# Match con la primera regla cuyo predicado se cumple. Predicados parciales
+# matchean cualquier valor en las claves no especificadas.
+ROUTING_MATRIX: list[tuple[dict[str, str], dict[str, Any]]] = [
+    # Tipo override: aclaracion_errores SIEMPRE va a la persona, sin CC
+    ({"tipo_correo": "aclaracion_errores"},
+     {"to": "persona", "cc": []}),
+    # Tipo override: derivado SIEMPRE va a la persona, sin CC
+    ({"tipo_correo": "derivado_volver_a_la_misma"},
+     {"to": "persona", "cc": []}),
+    # Critico (primer_envio o recordatorio): jefe TO, persona en CC
+    ({"tipo_correo": "primer_envio", "zona": "critico"},
+     {"to": "jefe", "cc": ["persona"]}),
+    ({"tipo_correo": "recordatorio", "zona": "critico"},
+     {"to": "jefe", "cc": ["persona"]}),
+    # Roce alto (no-critico): persona TO, jefe en CC siempre
+    ({"tipo_correo": "primer_envio", "nivel_roce": "alto"},
+     {"to": "persona", "cc": ["jefe"]}),
+    ({"tipo_correo": "recordatorio", "nivel_roce": "alto"},
+     {"to": "persona", "cc": ["jefe"]}),
+    # Roce medio + zonas tensas (p84/p50): persona TO, jefe en CC
+    ({"tipo_correo": "primer_envio", "zona": "p84", "nivel_roce": "medio"},
+     {"to": "persona", "cc": ["jefe"]}),
+    ({"tipo_correo": "primer_envio", "zona": "p50", "nivel_roce": "medio"},
+     {"to": "persona", "cc": ["jefe"]}),
+    ({"tipo_correo": "recordatorio", "zona": "p84", "nivel_roce": "medio"},
+     {"to": "persona", "cc": ["jefe"]}),
+    ({"tipo_correo": "recordatorio", "zona": "p50", "nivel_roce": "medio"},
+     {"to": "persona", "cc": ["jefe"]}),
 ]
-_MESES_ES = [
-    "enero", "febrero", "marzo", "abril", "mayo", "junio",
-    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
-]
+
+ROUTING_DEFAULT: dict[str, Any] = {"to": "persona", "cc": []}
 
 
-def _fecha_humana(dt) -> str:
-    """Devuelve 'martes 28 de abril a las 12:00' (incluye hora siempre)."""
-    return (
-        f"{_DIAS_ES[dt.weekday()]} {dt.day} de {_MESES_ES[dt.month - 1]} "
-        f"a las {dt.strftime('%H:%M')}"
-    )
-
-SYSTEM_PROMPT = """\
-Sos un coordinador de equipo del área regulatoria de un banco chileno.
-Escribís correos para mantener entregables al día con tus colegas.
-
-VOZ: la de un coordinador humano que conoce a sus colegas. Profesional,
-cordial, claro. Español chileno-corporativo, NO acartonado. Imaginá cómo
-le escribiría a un compañero alguien que se preocupa de que las cosas
-salgan bien sin pisar a nadie.
-
-PROHIBIDO mencionar vocabulario técnico interno del sistema. NUNCA usás
-los términos: "lead time", "estadística", "estadísticamente",
-"probabilidad", "probable", "percentil", "sigma", "varianza", "margen",
-"holgura", "deadline" (decí "plazo" o nombrá la fecha), "horas hábiles",
-"horas restantes", "tiempo disponible", "dentro de N horas". Tampoco
-hacés cuentas explícitas tipo "quedan X horas". Esos son conceptos
-internos; en el correo solo aparecen fechas concretas.
-
-FORMATO:
-- Devolvés SOLO el cuerpo del correo: sin asunto, sin firma de bot, sin
-  meta-comentarios, sin placeholders entre corchetes (tipo [Nombre]).
-- Estructura: saludo + 1-2 frases de contexto (qué tarea es, fecha del
-  plazo) + pedido concreto + cierre amable.
-- Si no conocés el nombre de la persona destinataria (jefatura genérica),
-  usás saludo natural: "Estimada jefatura del área X", "Hola equipo".
-
-ZONAS — cuatro niveles de urgencia interna que afectan el TONO pero
-NUNCA se nombran en el correo:
-
-1. "p97" — el plazo está holgado, es solo un ping para tener la tarea
-   en el radar. Tono casual, sin urgencia.
-   Ejemplo: "Te escribo para que tengamos en el radar la confirmación
-   de las cuentas TC, que vence el martes 28."
-
-2. "p84" — el plazo se está acercando, todavía hay tiempo razonable.
-   Recordatorio firme y amable, sin alarmismo.
-   Ejemplo: "Te escribo para coordinar la entrega de las glosas LSC
-   antes del jueves 30."
-
-3. "p50" — el plazo aprieta y conviene moverse pronto. URGENCIA
-   CONTROLADA: pedís coordinación o avance, NO suena alarmista.
-   Ejemplo: "Te escribo para coordinar la entrega de X antes del
-   viernes 2 de mayo. ¿Podemos sincronizar para asegurar que salga?"
-   NO digás "quedan pocas horas", "el plazo se acaba", "urgente".
-
-4. "critico" — el correo va al JEFE DEL ÁREA pidiendo apoyo. La persona
-   asignada va en copia. Pedido humano y franco, NO cuantitativo.
-   SALUDO FORMAL obligatorio (NUNCA "Hola," seco): empezás con
-   "Estimada jefatura del área X," o "Hola jefatura del área X,".
-   Cordial pero respetuoso del rol.
-   FECHA DEL PLAZO obligatoria en el cuerpo: es la información más
-   importante del correo. Mencionala en formato humano ("antes del
-   martes 5 de mayo", "para el jueves 30 a las 18:00").
-   Ejemplo: "Estimada jefatura del área LSC, quería pedirte apoyo
-   para empujar la validación de las glosas con Yolanda antes del
-   jueves 30 de abril. El plazo nos está quedando muy ajustado y
-   queremos coordinar para no fallar la entrega. Agradezco tu apoyo."
-   El argumento es de gestión y coordinación, no de estadística.
-   NUNCA digás "no llegará a entregar", "según su ritmo habitual",
-   o cualquier referencia a métricas o cálculos.
-
-NIVEL DE ROCE — afecta solo el registro:
-- "bajo": tratamiento "tú", directo y conciso, sin excesos.
-- "medio": equilibrado, formal pero cercano. "Tú" o "usted" según
-  lo que suene natural.
-- "alto": tratamiento "usted", máxima cordialidad y formalidad,
-  evitás cualquier presión percibida.
-
-ROL del destinatario directo:
-- "ejecutor" (no-critico): le pedís ejecutar o responder.
-- "jefe" (no-critico): le pedís priorización, destrabe o visibilidad,
-  no que ejecute.
-- En "critico" siempre te dirigís al jefe del área.
-
-FECHAS: las mencionás de forma natural ("el martes 28 de abril", "antes
-del viernes 2 de mayo", "para el jueves 30"). Si la hora es relevante
-(plazos a media jornada) la incluís ("el martes 28 al mediodía"). NO
-mencionás cuántas horas quedan ni hacés cuentas.
-"""
+def _lookup_routing(
+    tipo_correo: str, zona: str, nivel_roce: str | None
+) -> dict[str, Any]:
+    contexto = {"tipo_correo": tipo_correo, "zona": zona, "nivel_roce": nivel_roce}
+    for predicado, resultado in ROUTING_MATRIX:
+        if all(contexto.get(k) == v for k, v in predicado.items()):
+            return resultado
+    return ROUTING_DEFAULT
 
 
 def _obtener_jefe_id(area_nombre: str | None) -> int | None:
-    """Devuelve el persona_id del jefe del área (rol = jefe_area)."""
     if area_nombre is None:
         return None
     sql = """
@@ -147,81 +95,282 @@ def _obtener_jefe_id(area_nombre: str | None) -> int | None:
     return row[0] if row else None
 
 
-def _decidir_routing(
-    trabajo: dict[str, Any],
-) -> tuple[list[int], list[int], str]:
-    """Devuelve (destinatarios_to, destinatarios_cc, nombre_destinatario_directo).
-
-    - critico: TO = jefe del área, CC = persona asignada.
-    - p97/p84/p50: TO = persona asignada. CC al jefe según nivel_roce:
-        bajo  → nunca CC (excepto en critico).
-        medio → CC desde p84.
-        alto  → CC siempre.
-    """
-    zona = trabajo["zona"]
-    nivel_roce = trabajo["nivel_roce"]
-    area = trabajo["area"]
+def _resolver_routing_a_ids(
+    routing: dict[str, Any], trabajo: dict[str, Any]
+) -> tuple[list[int], list[int]]:
     persona_id = trabajo["persona_id"]
-    persona_nombre = trabajo["persona"]
-    jefe_id = _obtener_jefe_id(area)
+    jefe_id = _obtener_jefe_id(trabajo.get("area"))
 
-    if zona == "critico":
-        if jefe_id is None:
-            return [persona_id], [], persona_nombre
-        return [jefe_id], [persona_id], f"jefe del área {area}"
+    def _resolver(token: str) -> int | None:
+        if token == "persona":
+            return persona_id
+        if token == "jefe":
+            return jefe_id
+        return None
 
-    cc: list[int] = []
-    if jefe_id is not None:
-        if nivel_roce == "alto":
-            cc = [jefe_id]
-        elif nivel_roce == "medio" and zona in ("p84", "p50"):
-            cc = [jefe_id]
-    return [persona_id], cc, persona_nombre
+    to_id = _resolver(routing["to"]) or persona_id  # fallback persona
+    cc_ids = [tid for token in routing["cc"] if (tid := _resolver(token)) is not None]
+    return [to_id], cc_ids
 
 
-def _user_prompt(trabajo: dict[str, Any], destinatario_nombre: str) -> str:
-    fecha = _fecha_humana(trabajo["deadline"])
-    es_critico = trabajo["zona"] == "critico"
-    nota_critico = (
-        f"\nNOTA: estás escribiendo al JEFE DEL ÁREA. "
-        f"La persona asignada ({trabajo['persona']}) va en copia.\n"
-        if es_critico
-        else ""
+# --------------------------------------------------------------------------
+# DESCRIPTORES PARA EL LLM (sin etiquetas internas)
+# --------------------------------------------------------------------------
+
+TRATAMIENTO_POR_ROCE: dict[str, str] = {
+    "bajo":  "tutear, directo y conciso, sin excesos de cortesía",
+    "medio": "balanceado, formal pero cercano",
+    "alto":  "tratamiento de usted, máxima cordialidad y formalidad",
+}
+
+URGENCIA_POR_ZONA: dict[str, str] = {
+    "p97":     "ping informativo casual, sin urgencia",
+    "p84":     "recordatorio firme y amable, el plazo se acerca pero hay margen",
+    "p50":     "urgencia controlada, el plazo aprieta — pedís coordinación, sin alarmismo",
+    "critico": "pedido franco de apoyo, el plazo está comprometido",
+}
+
+INTENCION_POR_TIPO: dict[str, str] = {
+    "primer_envio":               "Es el primer correo sobre esta tarea. Presentás el tema y pedís lo que corresponda según el destinatario.",
+    "recordatorio":               "Ya escribiste antes y la persona no respondió. Recordás brevemente el tema sin reproche y reiterás el pedido.",
+    "aclaracion_errores":         "La persona respondió pero su respuesta tenía errores de formato. Le pedís corregirlos citando los errores específicos. NO reproches, NO alarmismo.",
+    "derivado_volver_a_la_misma": "La persona te derivó la responsabilidad a otra. Le explicás que como responsable formal, necesitás que la respuesta venga directamente de su lado. Cordial pero firme.",
+}
+
+SUBJECT_POR_TIPO_CORREO: dict[str, str] = {
+    "aclaracion_errores":         "Aclaración solicitada: {descripcion}",
+    "derivado_volver_a_la_misma": "Seguimiento: {descripcion}",
+}
+
+SUBJECT_POR_ZONA: dict[str, str] = {
+    "p97":     "Recordatorio: {descripcion}",
+    "p84":     "Recordatorio - Deadline próximo: {descripcion}",
+    "p50":     "URGENTE - Deadline en riesgo: {descripcion}",
+    "critico": "Solicito apoyo - Riesgo de incumplimiento: {descripcion}",
+}
+
+
+def _calcular_asunto(tipo_correo: str, trabajo: dict[str, Any]) -> str:
+    if tipo_correo in SUBJECT_POR_TIPO_CORREO:
+        plantilla = SUBJECT_POR_TIPO_CORREO[tipo_correo]
+    else:
+        plantilla = SUBJECT_POR_ZONA[trabajo["zona"]]
+    return plantilla.format(descripcion=trabajo["descripcion"])
+
+
+# --------------------------------------------------------------------------
+# FECHA HUMANA
+# --------------------------------------------------------------------------
+
+_DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+_MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
+def _fecha_humana(dt) -> str:
+    return (
+        f"{_DIAS_ES[dt.weekday()]} {dt.day} de {_MESES_ES[dt.month - 1]} "
+        f"a las {dt.strftime('%H:%M')}"
     )
-    return f"""\
-Generá el cuerpo del correo para el siguiente caso.
 
-DESTINATARIO PRINCIPAL: {destinatario_nombre}{nota_critico}
 
-PERSONA ASIGNADA AL TRABAJO
-- Nombre: {trabajo['persona']}
-- Rol: {trabajo['rol']}
-- Área: {trabajo['area']}
-- Nivel de roce: {trabajo['nivel_roce']}
+# --------------------------------------------------------------------------
+# PROMPT PARA EL LLM (solo redacción)
+# --------------------------------------------------------------------------
 
-TRABAJO
-- Descripción: {trabajo['descripcion']}
-- Plazo: {fecha}
+SYSTEM_PROMPT = """\
+Sos un coordinador de equipo del área regulatoria de un banco chileno.
+Escribís correos para mantener entregables al día con tus colegas.
 
-ZONA: {trabajo['zona']}
+VOZ
+- Coordinador humano, cordial, claro. Profesional pero NO acartonado.
+- Español chileno-corporativo.
+
+PROHIBIDO
+- Mencionar vocabulario técnico interno: "lead time", "estadística",
+  "estadísticamente", "probabilidad", "probable", "percentil", "sigma",
+  "varianza", "margen", "holgura", "deadline" (decí "plazo" o nombrá la
+  fecha), "horas hábiles", "horas restantes", "tiempo disponible",
+  "dentro de N horas". NO hacés cuentas explícitas tipo "quedan X horas".
+- Dejar placeholders entre corchetes ([Nombre], [fecha], etc.).
+
+FORMATO
+- Devolvés SOLO el cuerpo del correo: sin asunto, sin firma de bot,
+  sin meta-comentarios.
+- Estructura por defecto: saludo + 1-2 frases de contexto + pedido
+  concreto + cierre amable.
+
+DESTINATARIO Y ROUTING — NO TE TOCA DECIDIRLOS.
+- El orquestador resuelve a quién va el correo y te lo informa en el
+  campo DESTINATARIO PRINCIPAL del user prompt.
+- Si dice un nombre de persona, escribís a esa persona con saludo
+  personalizado ("Hola Yolanda,", "Estimado Carlos,").
+- Si dice "jefatura del área X", usás saludo formal a esa jefatura
+  ("Estimada jefatura del área LSC,").
+- Si el user prompt incluye PERSONA EN COPIA, mencionás a esa persona
+  brevemente en el cuerpo (porque la copia la va a leer también).
+  Si no hay PERSONA EN COPIA, no mencionás nada de copias.
+- NUNCA cambiás el destinatario. NUNCA escalás al jefe por tu cuenta.
+
+INTENCIÓN, TRATAMIENTO Y TONO
+- INTENCIÓN: el orquestador te pasa una descripción de qué pretendés
+  con este correo. Tu cuerpo cumple esa intención.
+- TRATAMIENTO: cómo te dirigís (tutear / usted / balanceado).
+- TONO: cómo se siente el correo (casual / firme / urgente / pedido
+  de apoyo). No inventes urgencia ni la reduzcas.
+
+ESTRUCTURA POR INTENCIÓN
+- Primer envío: saludo + presentación breve del tema + pedido + cierre.
+- Recordatorio: saludo + recordás el tema sin reproche + reiterás el
+  pedido + cierre.
+- Pedido de corrección (errores en respuesta): saludo + agradecés la
+  respuesta brevemente + citás cada error con el dato concreto + pedís
+  corrección + cierre. NUNCA reproche.
+- Devolver responsabilidad (derivación): saludo + reconocés que la
+  otra persona está al tanto + explicás que como destinatario sos
+  el responsable formal y necesitás respuesta directa + cierre.
+
+FECHAS — las mencionás de forma natural ("el martes 28 de abril",
+"antes del viernes 2 de mayo", "para el jueves 30"). Si la hora es
+relevante (plazos a media jornada) la incluís ("el martes 28 al
+mediodía"). NO mencionás cuántas horas quedan.
 """
 
 
-def generar_correo(trabajo: dict[str, Any]) -> dict[str, Any]:
-    """Devuelve el dict listo para persistir en `mensajes`."""
-    destinatarios_to, destinatarios_cc, destinatario_nombre = _decidir_routing(trabajo)
-    asunto = SUBJECT_POR_ZONA[trabajo["zona"]].format(
-        descripcion=trabajo["descripcion"]
+def _user_prompt(
+    trabajo: dict[str, Any],
+    destinatario_principal: str,
+    persona_en_copia: str | None,
+    intencion: str,
+    tratamiento: str,
+    tono: str,
+    contexto_extra: dict[str, Any] | None,
+    nombre_adjunto: str | None = None,
+) -> str:
+    fecha = _fecha_humana(trabajo["deadline"])
+
+    bloque_copia = (
+        f"PERSONA EN COPIA: {persona_en_copia} (mencionar brevemente en el cuerpo)\n"
+        if persona_en_copia
+        else ""
     )
 
+    bloque_adjunto = (
+        f"ADJUNTO: este correo lleva un Excel adjunto ({nombre_adjunto}) "
+        f"con el detalle de las glosas a corregir. Mencionalo explícitamente "
+        f"en el cuerpo (ej: 'Adjunto Excel con el detalle de las glosas a "
+        f"corregir.').\n"
+        if nombre_adjunto
+        else ""
+    )
+
+    bloque_extra = ""
+    if contexto_extra:
+        if "errores_detectados" in contexto_extra:
+            errores = contexto_extra.get("errores_detectados") or []
+            respuesta = (contexto_extra.get("respuesta_anterior") or "").strip()
+            bloque_extra = (
+                "RESPUESTA ANTERIOR DEL DESTINATARIO (citá lo relevante):\n"
+                f"---\n{respuesta}\n---\n\n"
+                "ERRORES DETECTADOS A MOSTRAR EN EL CORREO:\n"
+                + "\n".join(f"- {e}" for e in errores)
+                + "\n"
+            )
+        elif "persona_a_la_que_derivo" in contexto_extra:
+            otro = contexto_extra.get("persona_a_la_que_derivo") or "(otra persona)"
+            bloque_extra = (
+                f"LA PERSONA TE DERIVÓ A: {otro}\n"
+                "El correo le devuelve la responsabilidad al destinatario.\n"
+            )
+
+    return f"""\
+DESTINATARIO PRINCIPAL: {destinatario_principal}
+{bloque_copia}{bloque_adjunto}
+INTENCIÓN: {intencion}
+
+TRATAMIENTO: {tratamiento}
+TONO: {tono}
+
+DATOS DEL TRABAJO
+- Descripción: {trabajo['descripcion']}
+- Plazo: {fecha}
+
+{bloque_extra}
+Generá el cuerpo del correo. No incluyas asunto ni firma.
+"""
+
+
+# --------------------------------------------------------------------------
+# Entrada pública
+# --------------------------------------------------------------------------
+
+
+def generar_correo(
+    trabajo: dict[str, Any],
+    *,
+    tipo_correo: str = "primer_envio",
+    contexto_extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Devuelve dict listo para `guardar_mensaje` / `enviar_mensaje`.
+
+    Si tipo_correo == 'primer_envio', genera Excel con glosas a corregir y
+    lo deja en `adjunto_bytes` + `nombre_adjunto` para que job_diario lo
+    pase a `enviar_mensaje`. Recordatorio asume que el Excel ya se mandó
+    en el primer envío y no lo regenera. Aclaracion/derivado no llevan
+    adjunto.
+    """
+    # 1. Routing determinístico (Python decide TO/CC).
+    routing = _lookup_routing(tipo_correo, trabajo["zona"], trabajo["nivel_roce"])
+    destinatarios_to, destinatarios_cc = _resolver_routing_a_ids(routing, trabajo)
+
+    # 2. Datos para el LLM (descriptores en lenguaje natural).
+    if routing["to"] == "jefe":
+        destinatario_principal = f"jefatura del área {trabajo['area']}"
+        persona_en_copia = (
+            trabajo["persona"] if "persona" in routing.get("cc", []) else None
+        )
+    else:
+        destinatario_principal = trabajo["persona"]
+        persona_en_copia = None
+
+    intencion = INTENCION_POR_TIPO[tipo_correo]
+    tratamiento = TRATAMIENTO_POR_ROCE.get(
+        trabajo.get("nivel_roce") or "",
+        "balanceado, formal pero cercano",
+    )
+    tono = URGENCIA_POR_ZONA.get(trabajo["zona"], "tono cordial estándar")
+
+    # 3. Adjunto (solo en primer_envio).
+    adjunto_bytes: bytes | None = None
+    nombre_adjunto: str | None = None
+    if tipo_correo == "primer_envio":
+        adjunto_bytes, nombre_adjunto = generar_excel_adjunto(trabajo)
+
+    # 4. LLM redacta el cuerpo.
     chat = ChatOpenAI(model=MODEL, temperature=TEMPERATURA)
     resp = chat.invoke(
         [
             SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=_user_prompt(trabajo, destinatario_nombre)),
+            HumanMessage(
+                content=_user_prompt(
+                    trabajo=trabajo,
+                    destinatario_principal=destinatario_principal,
+                    persona_en_copia=persona_en_copia,
+                    intencion=intencion,
+                    tratamiento=tratamiento,
+                    tono=tono,
+                    contexto_extra=contexto_extra,
+                    nombre_adjunto=nombre_adjunto,
+                )
+            ),
         ]
     )
     contenido = resp.content.strip()
+
+    # 5. Asunto determinístico.
+    asunto = _calcular_asunto(tipo_correo, trabajo)
 
     return {
         "trabajo_id": trabajo["trabajo_id"],
@@ -231,4 +380,7 @@ def generar_correo(trabajo: dict[str, Any]) -> dict[str, Any]:
         "asunto": asunto,
         "contenido": contenido,
         "zona": trabajo["zona"],
+        "tipo_correo": tipo_correo,
+        "adjunto_bytes": adjunto_bytes,
+        "nombre_adjunto": nombre_adjunto,
     }

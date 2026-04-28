@@ -14,7 +14,7 @@
 
 ### Formato estricto
 - IOC: número de 6 dígitos (identificador del caso)
-- RUT: 10 dígitos con padding de ceros si es más corto, separado por UN ESPACIO antes del dígito verificador
+- RUT: 10 caracteres totales = 8 dígitos + 1 espacio + 1 dígito verificador. Padding con ceros a la izquierda si el RUT base es menor. Ejemplo: 12345678 9
 - ID: número de 6 dígitos
 - Responsable: inicial nombre + inicial primer apellido + inicial segundo apellido
 - Sigla de tipo de pago (solo en cuentas contables de castigo):

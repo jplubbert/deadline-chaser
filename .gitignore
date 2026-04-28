@@ -6,3 +6,4 @@ __pycache__/
 .pytest_cache/
 token.json
 credentials.json
+sample_excel_output.xlsx

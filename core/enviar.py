@@ -56,6 +56,8 @@ def _construir_mime(
     asunto: str,
     contenido: str,
     reply_to: str | None,
+    adjunto_bytes: bytes | None = None,
+    nombre_adjunto: str | None = None,
 ) -> str:
     msg = EmailMessage()
     msg["To"] = ", ".join(to)
@@ -65,6 +67,13 @@ def _construir_mime(
     if reply_to:
         msg["Reply-To"] = reply_to
     msg.set_content(contenido)
+    if adjunto_bytes and nombre_adjunto:
+        msg.add_attachment(
+            adjunto_bytes,
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=nombre_adjunto,
+        )
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
 
 
@@ -101,22 +110,29 @@ def _persistir_envio(
     mensaje_id: int,
     gmail_id: str,
     zona_al_enviar: str | None,
+    tiene_adjunto: bool,
 ) -> None:
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE mensajes "
             "SET gmail_message_id = %s, enviado_at = NOW(), "
-            "    zona_al_enviar = %s "
+            "    zona_al_enviar = %s, tiene_adjunto = %s "
             "WHERE mensaje_id = %s",
-            (gmail_id, zona_al_enviar, mensaje_id),
+            (gmail_id, zona_al_enviar, tiene_adjunto, mensaje_id),
         )
 
 
-def enviar_mensaje(mensaje: dict[str, Any]) -> dict[str, Any]:
+def enviar_mensaje(
+    mensaje: dict[str, Any],
+    *,
+    adjunto_bytes: bytes | None = None,
+    nombre_adjunto: str | None = None,
+) -> dict[str, Any]:
     """Envía el mensaje y devuelve {gmail_message_id, to_efectivo, cc_efectivo, dry_run}.
 
     `mensaje` es un dict con: mensaje_id, destinatarios_to (list[int]),
     destinatarios_cc (list[int] | None), asunto (str), contenido (str).
+    Si `adjunto_bytes` y `nombre_adjunto` están seteados, se adjuntan al MIME.
     """
     to_real = _resolver_emails(mensaje["destinatarios_to"] or [])
     cc_real = _resolver_emails(mensaje.get("destinatarios_cc") or [])
@@ -144,12 +160,18 @@ def enviar_mensaje(mensaje: dict[str, Any]) -> dict[str, Any]:
         asunto = mensaje["asunto"]
         contenido = mensaje["contenido"]
 
-    raw = _construir_mime(to_efectivo, cc_efectivo, asunto, contenido, reply_to)
+    raw = _construir_mime(
+        to_efectivo, cc_efectivo, asunto, contenido, reply_to,
+        adjunto_bytes=adjunto_bytes, nombre_adjunto=nombre_adjunto,
+    )
     service = get_gmail_service()
     sent = service.users().messages().send(userId="me", body={"raw": raw}).execute()
     gmail_id = sent["id"]
 
-    _persistir_envio(mensaje["mensaje_id"], gmail_id, mensaje.get("zona"))
+    tiene_adjunto = bool(adjunto_bytes and nombre_adjunto)
+    _persistir_envio(
+        mensaje["mensaje_id"], gmail_id, mensaje.get("zona"), tiene_adjunto,
+    )
 
     return {
         "gmail_message_id": gmail_id,
@@ -157,4 +179,5 @@ def enviar_mensaje(mensaje: dict[str, Any]) -> dict[str, Any]:
         "cc_efectivo": cc_efectivo,
         "reply_to": reply_to,
         "dry_run": dry_run,
+        "tiene_adjunto": tiene_adjunto,
     }

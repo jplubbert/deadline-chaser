@@ -43,7 +43,7 @@ def get_trabajos_pendientes() -> list[dict]:
                 p.correo       AS asignado_correo
         FROM    trabajos t
         LEFT JOIN personas p ON p.persona_id = t.persona_asignada_id
-        WHERE   t.estado = 'pendiente'
+        WHERE   t.estado <> 'respondido_ok'
         ORDER BY t.deadline ASC
     """
     with get_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -92,9 +92,26 @@ def ultimo_mensaje_enviado_de_trabajo(trabajo_id: int) -> dict | None:
                 gmail_message_id, timestamp, enviado_at,
                 zona_al_enviar
         FROM    mensajes
-        WHERE   trabajo_id = %s AND enviado_at IS NOT NULL
+        WHERE   trabajo_id = %s
+                AND remitente_id = 0
+                AND enviado_at IS NOT NULL
         ORDER BY enviado_at DESC
         LIMIT   1
+    """
+    with get_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (trabajo_id,))
+        return cur.fetchone()
+
+
+def ultima_respuesta_a_trabajo(trabajo_id: int) -> dict | None:
+    """Última respuesta de la persona (remitente_id != 0) para un trabajo."""
+    sql = """
+        SELECT  mensaje_id, trabajo_id, remitente_id,
+                contenido, asunto, gmail_message_id, timestamp, procesada
+        FROM    mensajes
+        WHERE   trabajo_id = %s AND remitente_id <> 0
+        ORDER BY timestamp DESC
+        LIMIT 1
     """
     with get_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, (trabajo_id,))
