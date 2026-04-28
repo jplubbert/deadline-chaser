@@ -13,11 +13,14 @@ listo para persistir en la tabla `mensajes`:
      asunto, contenido, zona, tipo_correo}
 """
 
+import os
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
 from core.db import get_connection
@@ -29,6 +32,34 @@ load_dotenv(_ENV_PATH)
 MODEL = "gpt-4o-mini"
 TEMPERATURA = 0.4
 AGENTE_PERSONA_ID = 0
+
+REGTECH_API_URL = os.environ.get("REGTECH_API_URL", "http://127.0.0.1:8001")
+
+
+# --------------------------------------------------------------------------
+# TOOL: PREDICTOR DE CRONOGRAMAS LEGALES (regtech-rag-chile)
+# --------------------------------------------------------------------------
+
+@tool
+def predecir_cronograma_legal(caso_data: dict) -> dict:
+    """Consulta el predictor del proyecto regtech-rag-chile y devuelve el
+    cronograma legal de un caso bajo Ley 20.009.
+
+    Recibe un dict con datos del caso (RUT cliente, fecha desconocimiento,
+    monto operación, autenticación reforzada, etc.) y devuelve la lista de
+    fechas críticas (bloqueo de tarjeta, primer pago, segundo pago, demanda)
+    junto con su fundamento legal (artículo + inciso) extraído vía RAG.
+
+    El servicio HTTP debe estar corriendo en REGTECH_API_URL (default
+    http://127.0.0.1:8001).
+    """
+    response = httpx.post(
+        f"{REGTECH_API_URL}/predecir-cronograma",
+        json=caso_data,
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 # --------------------------------------------------------------------------
