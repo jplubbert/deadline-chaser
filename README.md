@@ -2,13 +2,35 @@
 
 AI agent that coordinates humans to deliver bank regulatory reporting on time. Built on a real domain — Chilean banking compliance — with synthetic data and a stylized version of the actual workflow the author lived during 3 years at Banco de Chile's fraud prevention team.
 
+## Demo
+
+<img width="1438" height="760" alt="image" src="https://github.com/user-attachments/assets/0509169e-eda4-40ca-8652-736240058bc8" />
+
+
+
+![Email sent by the agent](docs/demo_email.png)
+
+The agent classifies a task as critical, routes it to the area manager with the assignee in CC, drafts a humanized email with an Excel attachment, and sends it via Gmail API. The Excel highlights the problematic character of each row in red.
+
+## Why this project is not just another LangChain agent
+
+Most public AI agent projects let the LLM decide everything: who to email, when, with what format. That works on demos and breaks on edge cases. This project takes a different approach grounded in real production patterns:
+
+- **Deterministic routing + creative generation**: the LLM does not decide who to email, when to send, or how urgent the task is. All of that lives in Python with explicit rules in a `ROUTING_MATRIX`. The LLM only writes the prose. This is auditable, testable without API calls, and cheap to extend.
+
+- **Domain-specific validation**: the agent validates Chilean RUT format using módulo 11 — the actual algorithm Chilean banks use. Format checks are component-by-component (IOC digits, RUT structure, ID format, responsible initials), not generic regex.
+
+- **Persona archetypes for testing at scale**: testing agents that interact with humans is hard because humans are unpredictable. The simulator models three archetypes (`certero`, `mixto`, `caotico`) with different response rates and behaviors (correct, late, wrong format, derivation to another person, ignore). End-to-end tests run reproducibly without waiting for real responses.
+
+- **Stateful reaction, not just reminders**: the agent reads responses, validates them, and reacts contextually. If the response is correct → close the task. If the response has format errors → send a clarification citing the specific errors. If the person derived responsibility → return ownership without escalating. State persists in DB and drives the next day's decision.
+
+- **Production-grade attachments**: Excel files with native red highlighting on the problematic character (using openpyxl RichText), not asterisks or markdown. Built to be opened in any Excel/Sheets client without rendering surprises.
+
 ## What it does
 
 The agent monitors pending regulatory tasks in a bank's compliance pipeline and decides when (and to whom) to send follow-up emails. It generates personalized emails with Excel attachments containing data inconsistencies that need to be corrected, reads responses, validates the corrections, and either closes the case or escalates with context-specific clarifications.
 
-The specific data format used in this project (LSC glosa structure: `IOC NNNNNN RUT XXXXXXXX X ID NNNNNN XXX`) is a simplified version inspired by real internal formats. The exact formats banks use are confidential. What is not confidential — and what this project aims to demonstrate — is the universal problem: every bank in LATAM has compliance teams chasing humans across departments to fix data inconsistencies before regulatory deadlines.
-
-Key design principle: **deterministic routing in Python, creative generation with LLM**. The LLM only writes prose; all decisions about who to email, when, and how urgent are made by Python with explicit rules.
+The specific data format used in this project (LSC glosa structure: `IOC NNNNNN RUT XXXXXXXX X ID NNNNNN XXX`) is a simplified version inspired by real internal formats. The exact formats banks use are confidential. What is not confidential — and what this project demonstrates — is the universal problem: every bank in LATAM has compliance teams chasing humans across departments to fix data inconsistencies before regulatory deadlines.
 
 ## Architecture
 
@@ -73,15 +95,6 @@ Key design principle: **deterministic routing in Python, creative generation wit
                               └─── back to ORCHESTRATOR
 ```
 
-## Why deterministic routing + creative generation
-
-A common failure mode in LLM agents is letting the model decide things that are not creative — like routing emails or applying business rules — and watching it contradict its own instructions. In this project, all routing decisions (who receives the email, who goes in CC, when to send, when to wait) are made in Python with explicit rules in a `ROUTING_MATRIX`. The LLM only sees the resolved recipient and writes the prose.
-
-This split has three concrete benefits:
-- **Auditable**: every routing decision traces back to a single rule, not "the LLM decided"
-- **Testable**: the router is pure Python; tests run without OpenAI calls
-- **Cheap to extend**: a new edge case adds one row to the matrix, no prompt rewrites
-
 ## Stack
 
 - Python 3.11
@@ -144,6 +157,8 @@ deadline-chaser/
 │   ├── procesar_respuestas.py     Validate and update task states
 │   ├── enviar_correos.py          Manual send
 │   └── test_gmail.py              OAuth smoke test
+├── docs/
+│   └── demo_email.png         Screenshot of agent output
 ├── dominio-banco.md           Banking compliance domain documentation
 ├── .env.example
 └── README.md
